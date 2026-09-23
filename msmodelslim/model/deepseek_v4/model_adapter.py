@@ -34,10 +34,15 @@ from msmodelslim.core.graph import AdapterConfig, MappingConfig
 from msmodelslim.processor.quarot import QuaRotInterface
 from msmodelslim.utils.exception import InvalidModelError
 from msmodelslim.utils.logging import logger_setter, get_logger
-from msmodelslim.utils.security import json_safe_load
+from msmodelslim.utils.security import json_safe_load, json_safe_dump
 from .convert_fp8_to_bf16 import auto_dequant_state_dict
 from .model import Transformer, ModelArgs, Block
 from .mtp_quant_module import get_mtp_layer, wrap_mtp_decoder, remove_zero_and_shift
+from ..common.checkpoint_integrity import (
+    CheckpointIntegrity,
+    check_checkpoint_or_raise,
+    clamp_block_count,
+)
 from ..common.layer_wise_forward import generated_decoder_layer_visit_func, TransformersForwardBreak
 from ..common.transformers import TransformersModel
 from ..common.weight_helper import get_state_dict
@@ -555,6 +560,29 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
     ) -> Tuple[str, nn.Module]:
         return prefix, module
 
+    def ascendv1_save_postprocess(self, model: nn.Module, save_directory: str) -> None:
+        """截断模式下，把产物 config.json 改写成实际导出的层数，否则导出的权重无法被加载。"""
+        del model
+        overrides = self.get_truncated_config_overrides()
+        if not overrides:
+            return
+        config_file = os.path.join(str(save_directory), 'config.json')
+        if not os.path.isfile(config_file):
+            get_logger().warning('No config.json under %s, cannot record the truncated layer count', save_directory)
+            return
+        config_data = json_safe_load(config_file, check_user_stat=True)
+        config_data.update(overrides)
+        config_data['msmodelslim_truncated_from'] = {
+            'model_path': str(self.model_path),
+            'missing_weight_files': getattr(getattr(self, 'checkpoint_integrity', None), 'missing_files', []),
+        }
+        json_safe_dump(config_data, config_file, indent=2, check_user_stat=True)
+        get_logger().warning(
+            'Checkpoint was truncated: config.json in %s now declares %s',
+            save_directory,
+            ', '.join(f'{key}={value}' for key, value in overrides.items() if key != 'compress_ratios'),
+        )
+
     def _load_config(self, trust_remote_code=False) -> object:
         config_data = json_safe_load(os.path.join(self.model_path, "config.json"))
         args = ModelArgs()
@@ -578,7 +606,48 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
                     n_mtp = 1
         args.n_mtp_layers = n_mtp
 
+        self.apply_checkpoint_truncation(args)
         return args
+
+    def apply_checkpoint_truncation(self, args: object) -> CheckpointIntegrity:
+        """权重目录不完整时的处理：默认报错，开启截断模式则把层数截到磁盘上实际可用的数量。
+
+        必须在任何权重被读取之前调用（`_load_config` 里），这样用户拿到的是一条一眼能看懂的
+        报错，而不是校准跑了半小时之后某个分片「文件不存在」。
+        """
+        integrity = check_checkpoint_or_raise(self.model_path)
+        # pylint: disable=attribute-defined-outside-init
+        self.checkpoint_integrity = integrity
+        # pylint: enable=attribute-defined-outside-init
+        if integrity.is_complete:
+            return integrity
+
+        declared_layers = int(getattr(args, 'num_hidden_layers', 0))
+        args.num_hidden_layers = clamp_block_count(integrity, 'layers', declared_layers, 'num_hidden_layers')
+        declared_mtp = int(getattr(args, 'n_mtp_layers', 0))
+        if declared_mtp > 0:
+            args.n_mtp_layers = min(declared_mtp, integrity.available_prefix_length('mtp'))
+            if args.n_mtp_layers != declared_mtp:
+                get_logger().warning(
+                    'Truncating n_mtp_layers from %s to %s to match the checkpoint on disk',
+                    declared_mtp,
+                    args.n_mtp_layers,
+                )
+        args.checkpoint_truncated = True
+        return integrity
+
+    def get_truncated_config_overrides(self) -> Dict[str, Any]:
+        """截断模式下需要写回产物 config.json 的字段，保证导出的权重能被加载。"""
+        if not getattr(self.config, 'checkpoint_truncated', False):
+            return {}
+        overrides: Dict[str, Any] = {'num_hidden_layers': self.config.num_hidden_layers}
+        n_mtp = getattr(self.config, 'n_mtp_layers', 0)
+        if n_mtp:
+            overrides['n_mtp_layers'] = n_mtp
+        compress_ratios = getattr(self.config, 'compress_ratios', None)
+        if compress_ratios is not None and len(compress_ratios) > self.config.num_hidden_layers:
+            overrides['compress_ratios'] = list(compress_ratios[: self.config.num_hidden_layers])
+        return overrides
 
     @classmethod
     def _get_args_mapping(cls) -> dict:

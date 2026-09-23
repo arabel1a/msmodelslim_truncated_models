@@ -193,9 +193,10 @@ class TestDeepSeekV4ModelAdapter(unittest.TestCase):
         self.assertEqual(result['layer1.weight'], 'tensor_layer1.weight')
         self.assertEqual(result['layer2.bias'], 'tensor_layer2.bias')
 
-    # Verify a missing weight file raises FileNotFoundError during state dict loading.
-    def test_get_state_dict_raises_file_not_found_when_weight_file_missing(self):
+    # Verify a missing weight file is reported as an incomplete checkpoint during state dict loading.
+    def test_get_state_dict_raises_invalid_model_when_weight_file_missing(self):
         from msmodelslim.model.common.weight_helper import get_state_dict, get_weight_map
+        from msmodelslim.utils.exception import InvalidModelError
 
         get_weight_map.cache_clear()
 
@@ -210,8 +211,27 @@ class TestDeepSeekV4ModelAdapter(unittest.TestCase):
                 side_effect=FileNotFoundError('not found'),
             ),
         ):
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaises(InvalidModelError) as ctx:
                 get_state_dict(str(self.model_path), mock_module)
+
+        self.assertIn('missing.safetensors', str(ctx.exception))
+        self.assertIn('MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT', str(ctx.exception))
+
+    # Verify a weight absent from the index is reported instead of raising a bare KeyError.
+    def test_get_state_dict_raises_invalid_model_when_weight_not_in_index(self):
+        from msmodelslim.model.common.weight_helper import get_state_dict, get_weight_map
+        from msmodelslim.utils.exception import InvalidModelError
+
+        get_weight_map.cache_clear()
+
+        mock_module = Mock(spec=nn.Module)
+        mock_module.named_parameters.return_value = [('layer.weight', Mock())]
+
+        with patch('msmodelslim.model.common.weight_helper.get_weight_map', return_value={}):
+            with self.assertRaises(InvalidModelError) as ctx:
+                get_state_dict(str(self.model_path), mock_module)
+
+        self.assertIn('layer.weight', str(ctx.exception))
 
     # Verify MTP decoder is returned when model.mtp already has it.
     def test_load_mtp_decoder_if_not_exist_creates_mtp_layer_when_decoder_missing(self):

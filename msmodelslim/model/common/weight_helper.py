@@ -29,6 +29,7 @@ from torch import nn
 from safetensors import safe_open
 from tqdm import tqdm
 
+from msmodelslim.utils.exception import InvalidModelError
 from msmodelslim.utils.security import get_valid_read_path, json_safe_load, MAX_READ_FILE_SIZE_512G
 
 
@@ -51,13 +52,31 @@ def get_state_dict(model_path: Union[str, Path], module: nn.Module, prefix: str 
         if name in exclude:
             continue
         weight_key = f'{prefix}.{name}' if prefix else name
-        file_name = weight_map[weight_key]
+        file_name = weight_map.get(weight_key)
+        if file_name is None:
+            raise InvalidModelError(
+                f'Weight {weight_key} is not listed in model.safetensors.index.json of {model_path}.',
+                action='Please check that the checkpoint matches the model type passed to --model_type.',
+            )
         groups[file_name].append(name)
 
     state_dict = {}
     for file_name in tqdm(groups, desc=f'Loading {prefix}'):
         file_path = os.path.join(model_path, file_name)
-        file_path = get_valid_read_path(file_path, extensions='safetensors', size_max=MAX_READ_FILE_SIZE_512G)
+        try:
+            file_path = get_valid_read_path(file_path, extensions='safetensors', size_max=MAX_READ_FILE_SIZE_512G)
+        except Exception as err:
+            if os.path.isfile(file_path):
+                raise
+            # 分片缺失时给一条能看懂的报错，而不是笼统的「路径不存在」。
+            raise InvalidModelError(
+                f'Weight file {file_name} of {model_path} is missing, '
+                f'it holds {len(groups[file_name])} weight(s) of "{prefix or "the model"}".',
+                action=(
+                    'The checkpoint is incomplete. Please download the missing safetensors files, or set '
+                    'MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT=1 to quantize only the layers present on disk.'
+                ),
+            ) from err
         with safe_open(file_path, framework='pt', device='cpu') as f:
             for name in tqdm(groups[file_name], desc=f'Loading {file_path}'):
                 state_dict[name] = f.get_tensor(f'{prefix}.{name}' if prefix else name)

@@ -43,6 +43,7 @@ from msmodelslim.utils.validation.conversion import (
 from msmodelslim.utils.validation.value import validate_str_length
 from .model_info_interface import ModelInfoInterface
 from .practice_manager_infra import PracticeManagerInfra, QuantConfigExportInfra
+from .save_path_guard import SavePathGuard
 
 DEFAULT_PEDIGREE = 'default'
 DEFAULT_QUANT_TYPE = QuantType.W8A8
@@ -514,18 +515,21 @@ class NaiveQuantizationApplication:
             config_path=config_path,
             tag=tag,
         )
-        # 使用量化配置导出基础设施导出配置
-        export_model_type = model_type or "convert"
-        self.quant_config_export_infra.export_quant_config(practice_config, export_model_type, save_path)
 
-        get_logger().info("Get best practice %s success.", practice_config.metadata.config_id)
+        # save_path 从这里开始被写入：失败时不要留下看起来像成品的半成品。
+        with SavePathGuard(save_path, model_path=model_path):
+            # 使用量化配置导出基础设施导出配置
+            export_model_type = model_type or "convert"
+            self.quant_config_export_infra.export_quant_config(practice_config, export_model_type, save_path)
 
-        get_logger().info("===========QUANTIZE MODEL===========")
-        self.quant_service.quantize(
-            quant_config=practice_config.extract_quant_config(),
-            model_adapter=model_adapter,
-            save_path=save_path,
-            device=device_type,
-            device_indices=device_index,
-        )
+            get_logger().info("Get best practice %s success.", practice_config.metadata.config_id)
+
+            get_logger().info("===========QUANTIZE MODEL===========")
+            self.quant_service.quantize(
+                quant_config=practice_config.extract_quant_config(),
+                model_adapter=model_adapter,
+                save_path=save_path,
+                device=device_type,
+                device_indices=device_index,
+            )
         get_logger().info("===========SUCCESS===========")

@@ -27,6 +27,7 @@ DeepSeek-V4-Flash-DSpark / DeepSeek-V4-Pro-DSpark 模型适配器。
 """
 
 import os
+from collections import Counter
 from typing import Any, Dict, Generator, List, Optional, Tuple
 from unittest.mock import patch
 
@@ -129,7 +130,8 @@ class DeepSeekV4DSparkModelAdapter(DeepSeekV4ModelAdapter):  # pylint: disable=t
             with patch.object(nn.Linear, "reset_parameters", lambda _self: None):
                 get_logger().info("Creating DSpark MTP decoder layer %s", mtp_idx)
                 layer_id = self.config.num_hidden_layers + mtp_idx
-                n_mtp = ensure_config_n_mtp_layers(self.config, str(self.model_path))
+                # config 上的值已在 _load_config 里按磁盘分片收敛过，勿再从 checkpoint 反推覆盖。
+                n_mtp = self._get_n_mtp_layers() or ensure_config_n_mtp_layers(self.config, str(self.model_path))
                 mtp_block = DSparkBlock(layer_id, self.config)
                 prune_dspark_mtp_stage_modules(mtp_block, mtp_idx, n_mtp)
 
@@ -210,7 +212,9 @@ class DeepSeekV4DSparkModelAdapter(DeepSeekV4ModelAdapter):  # pylint: disable=t
         if dist.is_initialized():
             dist.barrier()
 
-        target_ids = set(getattr(self.config, "dspark_target_layer_ids", ()) or ())
+        # 按出现次数计数而非去重：截断权重下多个 target 会被重定位到同一层，
+        # 而 main_proj 的入维取决于 target 的个数。
+        target_counts = Counter(self._effective_target_layer_ids())
         main_hiddens: List[torch.Tensor] = []
         main_x: Optional[torch.Tensor] = None
         mtp_decode_pos: Optional[int] = None
@@ -223,8 +227,9 @@ class DeepSeekV4DSparkModelAdapter(DeepSeekV4ModelAdapter):  # pylint: disable=t
             if name.startswith("layers."):
                 layer_idx = int(name.split(".")[1])
                 h = yield ProcessRequest(name, block, args, kwargs)
-                if layer_idx in target_ids:
-                    main_hiddens.append(h.mean(dim=2))
+                repeat = target_counts.get(layer_idx, 0)
+                if repeat:
+                    main_hiddens.extend([h.mean(dim=2)] * repeat)
                 args = (h, start_pos, input_ids)
                 continue
 
@@ -464,9 +469,51 @@ class DeepSeekV4DSparkModelAdapter(DeepSeekV4ModelAdapter):  # pylint: disable=t
         args.hc_mult = config_data.get("hc_mult", getattr(args, "hc_mult", 4))
 
         args.n_mtp_layers = ensure_config_n_mtp_layers(args, str(self.model_path), config_data)
+        # n_mtp_layers 是在基类截断之后才定下来的，这里按磁盘上的分片再收一次，并重定位 target 层。
+        self.apply_checkpoint_truncation(args)
+        args.dspark_effective_target_layer_ids = self._remap_target_layer_ids(args)
         get_logger().info(
             "DSpark config: n_mtp_layers=%s, target_layer_ids=%s",
             args.n_mtp_layers,
             args.dspark_target_layer_ids,
         )
         return args
+
+    @staticmethod
+    def _remap_target_layer_ids(args: object) -> Tuple[int, ...]:
+        """把越界的 dspark_target_layer_ids 压到最后一层。
+
+        截断权重下原始 target id（例如 14/29/44/60）多半已经不存在，主模型前向就采不到
+        main_hidden。个数不能改 —— mtp.0.main_proj 的入维是 dim * len(target_ids) —— 所以
+        逐个 clamp 到最后一层，重复的 id 在前向里按出现次数各取一份。
+        """
+        target_ids = tuple(getattr(args, "dspark_target_layer_ids", ()) or ())
+        num_layers = int(getattr(args, "num_hidden_layers", 0))
+        if not target_ids or num_layers <= 0:
+            return target_ids
+        last = num_layers - 1
+        remapped = tuple(min(idx, last) for idx in target_ids)
+        if remapped != target_ids:
+            get_logger().warning(
+                "dspark_target_layer_ids %s exceed the %s layers present on disk, remapped to %s. "
+                "The calibration graph runs, but the draft head sees the wrong hidden states.",
+                target_ids,
+                num_layers,
+                remapped,
+            )
+        return remapped
+
+    def _effective_target_layer_ids(self) -> Tuple[int, ...]:
+        effective = getattr(self.config, "dspark_effective_target_layer_ids", None)
+        if effective is None:
+            return tuple(getattr(self.config, "dspark_target_layer_ids", ()) or ())
+        return tuple(effective)
+
+    def get_truncated_config_overrides(self) -> Dict[str, Any]:
+        overrides = super().get_truncated_config_overrides()
+        if not overrides:
+            return overrides
+        effective = self._effective_target_layer_ids()
+        if effective and tuple(getattr(self.config, "dspark_target_layer_ids", ()) or ()) != effective:
+            overrides["dspark_target_layer_ids"] = list(effective)
+        return overrides
