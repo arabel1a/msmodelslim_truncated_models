@@ -40,8 +40,10 @@ from .model import Transformer, ModelArgs, Block
 from .mtp_quant_module import get_mtp_layer, wrap_mtp_decoder, remove_zero_and_shift
 from ..common.checkpoint_integrity import (
     CheckpointIntegrity,
-    check_checkpoint_or_raise,
     clamp_block_count,
+    enforce_checkpoint_integrity,
+    record_missing_block_keys,
+    scan_checkpoint,
 )
 from ..common.layer_wise_forward import generated_decoder_layer_visit_func, TransformersForwardBreak
 from ..common.transformers import TransformersModel
@@ -615,7 +617,9 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
         必须在任何权重被读取之前调用（`_load_config` 里），这样用户拿到的是一条一眼能看懂的
         报错，而不是校准跑了半小时之后某个分片「文件不存在」。
         """
-        integrity = check_checkpoint_or_raise(self.model_path)
+        integrity = scan_checkpoint(self.model_path)
+        self._record_expected_layer_keys(integrity, args)
+        integrity = enforce_checkpoint_integrity(integrity, self.model_path)
         # pylint: disable=attribute-defined-outside-init
         self.checkpoint_integrity = integrity
         # pylint: enable=attribute-defined-outside-init
@@ -629,12 +633,41 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
             args.n_mtp_layers = min(declared_mtp, integrity.available_prefix_length('mtp'))
             if args.n_mtp_layers != declared_mtp:
                 get_logger().warning(
-                    'Truncating n_mtp_layers from %s to %s to match the checkpoint on disk',
+                    'Truncating n_mtp_layers from %s to %s to match the weights the checkpoint provides',
                     declared_mtp,
                     args.n_mtp_layers,
                 )
         args.checkpoint_truncated = True
         return integrity
+
+    def _record_expected_layer_keys(self, integrity: CheckpointIntegrity, args: object) -> None:
+        """逐层核对 index 是否列全了这一层真正需要的权重。
+
+        不能从 key 的出现规律去猜「这层该有什么」：DeepSeek-V4 各层结构本就不同 ——
+        compress_ratio 交替 4/128 决定 attn.indexer 在不在，前 n_hash_layers 层用
+        ffn.gate.tid2eid、其余层用 ffn.gate.bias。所以直接在 meta device 上把每层搭出来
+        取 named_parameters，既精确又便宜（约 10ms/层，不分配任何显存/内存）。
+        """
+        declared = int(getattr(args, 'num_hidden_layers', 0))
+        listed = integrity.block_keys.get('layers', {})
+        if declared <= 0 or not listed:
+            return
+        ratios = getattr(args, 'compress_ratios', None) or ()
+        expected: Dict[int, set] = {}
+        try:
+            with torch.device('meta'), patch.object(nn.Linear, 'reset_parameters', lambda _self: None):
+                for idx in range(declared):
+                    if idx not in listed:
+                        continue
+                    if ratios and idx >= len(ratios):
+                        break
+                    block = Block(idx, args)
+                    expected[idx] = {name for name, _ in block.named_parameters()}
+        except Exception as err:  # pylint: disable=broad-except
+            # 这只是一道前置体检，搭不出来就退回到原来的「读到哪层报哪层」。
+            get_logger().debug('Skipping the per-layer weight check: %s', err)
+            return
+        record_missing_block_keys(integrity, 'layers', expected)
 
     def get_truncated_config_overrides(self) -> Dict[str, Any]:
         """截断模式下需要写回产物 config.json 的字段，保证导出的权重能被加载。"""

@@ -18,10 +18,14 @@ You may obtain a copy of Mulan PSL v2 at:
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
+from torch import nn
 
 from msmodelslim.model.common.checkpoint_integrity import ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT
+from msmodelslim.model.deepseek_v4.model import Block, ModelArgs
 from msmodelslim.model.deepseek_v4.model_adapter import DeepSeekV4ModelAdapter
 from msmodelslim.utils.exception import InvalidModelError
 
@@ -154,3 +158,78 @@ class TestAscendV1SavePostprocess:
         adapter.ascendv1_save_postprocess(model=None, save_directory=str(save_path))
 
         assert json.loads(config_file.read_text(encoding="utf-8")) == {"num_hidden_layers": 6}
+
+
+REAL_LAYERS = 6
+
+
+def build_index_from_real_blocks(root: Path, num_layers=REAL_LAYERS, drop=()):
+    """用真实的 Block 参数名造一份 index。
+
+    这样各层之间天然带着结构差异（compress_ratio==4 才有 attn.indexer，前
+    n_hash_layers 层用 ffn.gate.tid2eid、其余层用 ffn.gate.bias），正是不能被误判成
+    「缺权重」的东西。
+    """
+    args = ModelArgs()
+    args.num_hidden_layers = num_layers
+    weight_map = {"embed.weight": "shared.safetensors", "head.weight": "shared.safetensors"}
+    with torch.device("meta"), patch.object(nn.Linear, "reset_parameters", lambda _self: None):
+        for idx in range(num_layers):
+            for name, _ in Block(idx, args).named_parameters():
+                weight_map[f"layers.{idx}.{name}"] = "shared.safetensors"
+    for key in drop:
+        weight_map.pop(key)
+
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    (root / "shared.safetensors").write_bytes(b"")
+    return root
+
+
+def fresh_args(num_layers=REAL_LAYERS):
+    args = ModelArgs()
+    args.num_hidden_layers = num_layers
+    args.n_mtp_layers = 0
+    return args
+
+
+class TestExpectedLayerKeys:
+    """index 少列了某一层的权重时（分片都在，键没了）的处理。"""
+
+    def test_a_complete_index_is_not_flagged_despite_structural_differences(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT, raising=False)
+        adapter = make_adapter(build_index_from_real_blocks(tmp_path / "m"))
+        args = fresh_args()
+
+        adapter.apply_checkpoint_truncation(args)
+
+        assert args.num_hidden_layers == REAL_LAYERS
+        assert adapter.checkpoint_integrity.missing_keys == {}
+
+    def test_raises_and_names_the_missing_weight(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT, raising=False)
+        adapter = make_adapter(build_index_from_real_blocks(tmp_path / "m", drop=("layers.4.hc_attn_fn",)))
+
+        with pytest.raises(InvalidModelError) as err:
+            adapter.apply_checkpoint_truncation(fresh_args())
+
+        assert "layers.4 has no hc_attn_fn" in str(err.value)
+
+    def test_truncates_to_the_layers_whose_weights_are_all_listed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT, "1")
+        adapter = make_adapter(build_index_from_real_blocks(tmp_path / "m", drop=("layers.4.hc_attn_fn",)))
+        args = fresh_args()
+
+        adapter.apply_checkpoint_truncation(args)
+
+        assert args.num_hidden_layers == 4
+        assert adapter.checkpoint_integrity.missing_keys == {"layers.4": ["hc_attn_fn"]}
+
+    def test_an_expert_weight_missing_from_one_layer_is_caught(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT, "1")
+        adapter = make_adapter(build_index_from_real_blocks(tmp_path / "m", drop=("layers.2.ffn.experts.0.w1.weight",)))
+        args = fresh_args()
+
+        adapter.apply_checkpoint_truncation(args)
+
+        assert args.num_hidden_layers == 2

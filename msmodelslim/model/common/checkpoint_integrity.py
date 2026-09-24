@@ -69,10 +69,14 @@ class CheckpointIntegrity:
     missing_blocks: Dict[str, Set[int]] = field(default_factory=dict)
     #: 不属于任何 block 的权重（embed/head/norm 等）是否完整
     shared_weights_complete: bool = True
+    #: index 自身就没列出的 block 权重，"layers.4" -> ["hc_attn_fn", ...]
+    missing_keys: Dict[str, List[str]] = field(default_factory=dict)
+    #: index 里每个 block 实际列出的权重后缀，prefix -> {序号 -> 后缀集合}
+    block_keys: Dict[str, Dict[int, Set[str]]] = field(default_factory=dict)
 
     @property
     def is_complete(self) -> bool:
-        return not self.missing_files
+        return not self.missing_files and not self.missing_keys
 
     def available_prefix_length(self, prefix: str) -> int:
         """`prefix` 下从 0 开始连续可用的 block 数量。"""
@@ -84,10 +88,23 @@ class CheckpointIntegrity:
 
     def describe(self, max_items: int = 8) -> str:
         """给用户看的一段摘要。"""
-        shown = self.missing_files[:max_items]
-        more = len(self.missing_files) - len(shown)
-        files = ', '.join(shown) + (f' (+{more} more)' if more > 0 else '')
-        parts = [f'{len(self.missing_files)}/{self.total_files} weight files are missing: {files}']
+        parts: List[str] = []
+        if self.missing_files:
+            shown = self.missing_files[:max_items]
+            more = len(self.missing_files) - len(shown)
+            files = ', '.join(shown) + (f' (+{more} more)' if more > 0 else '')
+            parts.append(f'{len(self.missing_files)}/{self.total_files} weight files are missing: {files}')
+        if self.missing_keys:
+            samples = []
+            for name, suffixes in list(self.missing_keys.items())[:3]:
+                listed = ', '.join(suffixes[:3]) + (f' (+{len(suffixes) - 3} more)' if len(suffixes) > 3 else '')
+                samples.append(f'{name} has no {listed}')
+            more = len(self.missing_keys) - len(samples)
+            tail = f' (+{more} more block(s))' if more > 0 else ''
+            parts.append(
+                f'model.safetensors.index.json does not list every weight of '
+                f'{len(self.missing_keys)} block(s): {"; ".join(samples)}{tail}'
+            )
         for prefix in sorted(self.missing_blocks):
             missing = sorted(self.missing_blocks[prefix])
             if not missing:
@@ -132,6 +149,52 @@ def _load_weight_map(model_path: str) -> Dict[str, str]:
     return json_safe_load(index_path).get('weight_map', {})
 
 
+def _split_block_suffix(weight_key: str) -> Optional[Tuple[str, int, str]]:
+    parsed = _split_block_key(weight_key)
+    if parsed is None:
+        return None
+    prefix, idx = parsed
+    return prefix, idx, weight_key[len(f'{prefix}.{idx}.') :]
+
+
+def _collect_block_keys(weight_map: Dict[str, str]) -> Dict[str, Dict[int, Set[str]]]:
+    """index 里的权重名按 block 归档：prefix -> {序号 -> 该 block 的权重后缀集合}。"""
+    blocks: Dict[str, Dict[int, Set[str]]] = {}
+    for weight_key in weight_map:
+        parsed = _split_block_suffix(weight_key)
+        if parsed is None:
+            continue
+        prefix, idx, suffix = parsed
+        blocks.setdefault(prefix, {}).setdefault(idx, set()).add(suffix)
+    return blocks
+
+
+def record_missing_block_keys(
+    integrity: CheckpointIntegrity,
+    prefix: str,
+    expected_by_index: Dict[int, Set[str]],
+) -> None:
+    """用「这个 block 真正需要哪些权重」来复核 index，并把缺权重的 block 标为不可用。
+
+    `expected_by_index` 由模型适配器给出（通常是在 meta device 上搭一个 block 后取
+    named_parameters），因此这里不做任何关于命名规律的猜测 —— DeepSeek-V4 各层结构本
+    来就不一致（compress_ratio 交替决定 attn.indexer 是否存在，前 n_hash_layers 层用
+    ffn.gate.tid2eid、其余层用 ffn.gate.bias），按 key 出现规律去推「该有什么」必然误判。
+    """
+    listed = integrity.block_keys.get(prefix, {})
+    for idx, expected in expected_by_index.items():
+        present = listed.get(idx)
+        if present is None:
+            continue  # index 里整个 block 都没有，由 available_prefix_length 处理
+        missing = expected - present
+        if not missing:
+            continue
+        integrity.missing_keys[f'{prefix}.{idx}'] = sorted(missing)
+        integrity.missing_blocks.setdefault(prefix, set()).add(idx)
+        integrity.present_blocks.setdefault(prefix, set()).discard(idx)
+    integrity.missing_keys = dict(sorted(integrity.missing_keys.items()))
+
+
 def scan_checkpoint(model_path: Union[str, Path]) -> CheckpointIntegrity:
     """比对 model.safetensors.index.json 与磁盘上的分片，返回完整性扫描结果。"""
     model_path = str(model_path)
@@ -143,25 +206,25 @@ def scan_checkpoint(model_path: Union[str, Path]) -> CheckpointIntegrity:
         missing_files=[name for name in referenced_files if not existing[name]],
         total_files=len(referenced_files),
     )
-    if integrity.is_complete:
-        return integrity
 
-    present: Dict[str, Set[int]] = {}
-    missing: Dict[str, Set[int]] = {}
+    blocks = _collect_block_keys(weight_map)
+    integrity.block_keys = blocks
+
+    present: Dict[str, Set[int]] = {prefix: set(per_idx) for prefix, per_idx in blocks.items()}
+    missing: Dict[str, Set[int]] = {prefix: set() for prefix in blocks}
     for weight_key, file_name in weight_map.items():
+        if existing[file_name]:
+            continue
         block = _split_block_key(weight_key)
         if block is None:
-            if not existing[file_name]:
-                integrity.shared_weights_complete = False
+            integrity.shared_weights_complete = False
             continue
-        prefix, idx = block
-        bucket = present if existing[file_name] else missing
-        bucket.setdefault(prefix, set()).add(idx)
+        missing[block[0]].add(block[1])
     # 一个 block 只要缺一个权重就不可用
     for prefix, indices in missing.items():
-        present.setdefault(prefix, set()).difference_update(indices)
+        present[prefix].difference_update(indices)
     integrity.present_blocks = present
-    integrity.missing_blocks = missing
+    integrity.missing_blocks = {prefix: indices for prefix, indices in missing.items() if indices}
     return integrity
 
 
@@ -182,7 +245,18 @@ def check_checkpoint_or_raise(model_path: Union[str, Path]) -> CheckpointIntegri
     Returns:
         CheckpointIntegrity: 扫描结果（完整时 `is_complete` 为 True）。
     """
-    integrity = scan_checkpoint(model_path)
+    return enforce_checkpoint_integrity(scan_checkpoint(model_path), model_path)
+
+
+def enforce_checkpoint_integrity(
+    integrity: CheckpointIntegrity,
+    model_path: Union[str, Path],
+) -> CheckpointIntegrity:
+    """对扫描结果下结论：完整则放行，不完整则按截断模式报错或告警。
+
+    与 `check_checkpoint_or_raise` 分开，是为了让调用方能在下结论之前先补充
+    `record_missing_block_keys` 那一步的信息。
+    """
     if integrity.is_complete:
         return integrity
 
@@ -191,9 +265,11 @@ def check_checkpoint_or_raise(model_path: Union[str, Path]) -> CheckpointIntegri
         raise InvalidModelError(
             f'Incomplete checkpoint at {model_path}: {summary}',
             action=(
-                'Please download the missing safetensors files. If the checkpoint was truncated on purpose '
-                f'(a debug model with fewer layers), set {ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT}=1 to quantize '
-                'only the layers that are present -- the result is NOT numerically usable.'
+                'Please download the missing safetensors files, or -- if weights are absent from '
+                'model.safetensors.index.json itself -- re-check the script that produced this checkpoint. '
+                f'If it was truncated on purpose (a debug model with fewer layers), set '
+                f'{ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT}=1 to quantize only the layers that are complete -- '
+                'the result is NOT numerically usable.'
             ),
         )
     if not integrity.shared_weights_complete:
@@ -206,7 +282,7 @@ def check_checkpoint_or_raise(model_path: Union[str, Path]) -> CheckpointIntegri
         )
     get_logger().warning('Incomplete checkpoint at %s: %s', model_path, summary)
     get_logger().warning(
-        '%s is set: quantizing only the layers present on disk. '
+        '%s is set: quantizing only the layers whose weights are complete. '
         'The produced weights are for pipeline debugging only, NOT for inference accuracy.',
         ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT,
     )
@@ -228,5 +304,10 @@ def clamp_block_count(
             f'No usable "{prefix}" block found in the checkpoint ({label} declares {declared}).',
             action='Please make sure at least the first decoder layer is fully present.',
         )
-    get_logger().warning('Truncating %s from %s to %s to match the checkpoint on disk', label, declared, available)
+    get_logger().warning(
+        'Truncating %s from %s to %s to match the weights the checkpoint actually provides',
+        label,
+        declared,
+        available,
+    )
     return available

@@ -66,7 +66,7 @@ msmodelslim quant [--model_type <model_type>] --model_path <model_path> --save_p
 |----------|------|-----------|--------|----------------|------|
 | `MSMODELSLIM_CUSTOM_PRACTICE_REPO` | `string` | 可选 | 无（未设置） | 目录路径 | 自定义最佳实践仓库目录；设置后与官方 `lab_practice` 一并参与最佳实践匹配。 |
 | `MSMODELSLIM_LOG_LEVEL` | `string` | 可选 | `INFO` | `INFO`、`DEBUG` | 设置日志级别；设置后打印同级及以上日志。 |
-| `MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT` | `string` | 可选 | 未设置 | `1`、`true`、`yes`、`on` | 允许量化不完整（被截断）的权重目录：`model.safetensors.index.json` 引用的分片只存在一部分时，把层数收敛到磁盘上从第 0 层起连续存在的层，只量化这些层。**产物仅用于打通流程，精度无意义**；未设置时遇到缺失分片会在加载权重前直接报错并列出缺失文件。 |
+| `MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT` | `string` | 可选 | 未设置 | `1`、`true`、`yes`、`on` | 允许量化不完整（被截断）的权重目录。两种不完整都会被识别：`model.safetensors.index.json` 引用的分片有缺失，或 index 本身就没列全某一层需要的权重（逐层在 meta device 上搭出该层取 `named_parameters` 精确比对，不依赖命名规律，因此 `attn.indexer`、`ffn.gate.tid2eid` 这类逐层不同的结构不会被误判）。设置后把层数收敛到从第 0 层起连续完整的那些层，只量化这些层。**产物仅用于打通流程，精度无意义**；未设置时会在加载权重前直接报错，并指明缺的是哪些分片、哪一层缺哪个权重。 |
 | `MSMODELSLIM_KEEP_FAILED_OUTPUT` | `string` | 可选 | 未设置 | `1`、`true`、`yes`、`on` | 量化失败时保留 `save_path` 下本次运行产生的中间文件（默认会删除，只删本次新增的条目）。无论是否设置，运行期间目录里都有 `.msmodelslim_incomplete` 标记，正常结束才会被删除。 |
 
 ## 7. 使用示例

@@ -56,7 +56,11 @@ def get_state_dict(model_path: Union[str, Path], module: nn.Module, prefix: str 
         if file_name is None:
             raise InvalidModelError(
                 f'Weight {weight_key} is not listed in model.safetensors.index.json of {model_path}.',
-                action='Please check that the checkpoint matches the model type passed to --model_type.',
+                action=(
+                    'Please check that the checkpoint matches the model type passed to --model_type, and that '
+                    'the script which produced it wrote every weight into the index. To quantize only the '
+                    'layers whose weights are complete, set MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT=1.'
+                ),
             )
         groups[file_name].append(name)
 
@@ -74,7 +78,7 @@ def get_state_dict(model_path: Union[str, Path], module: nn.Module, prefix: str 
                 f'it holds {len(groups[file_name])} weight(s) of "{prefix or "the model"}".',
                 action=(
                     'The checkpoint is incomplete. Please download the missing safetensors files, or set '
-                    'MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT=1 to quantize only the layers present on disk.'
+                    'MSMODELSLIM_ALLOW_TRUNCATED_CHECKPOINT=1 to quantize only the complete layers.'
                 ),
             ) from err
         with safe_open(file_path, framework='pt', device='cpu') as f:

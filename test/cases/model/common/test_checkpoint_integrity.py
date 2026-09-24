@@ -23,6 +23,7 @@ from msmodelslim.model.common.checkpoint_integrity import (
     _format_int_ranges,
     check_checkpoint_or_raise,
     clamp_block_count,
+    record_missing_block_keys,
     resolve_block_count,
     scan_checkpoint,
 )
@@ -195,3 +196,80 @@ class TestClampBlockCount:
 
         with pytest.raises(InvalidModelError):
             clamp_block_count(integrity, "layers", 61, "num_hidden_layers")
+
+
+class TestRecordMissingBlockKeys:
+    """index 列出的权重要用「这个 block 真正需要什么」来复核。"""
+
+    @staticmethod
+    def _scan(tmp_path):
+        return scan_checkpoint(_build_checkpoint(tmp_path, num_layers=6, num_mtp=0))
+
+    def test_block_keys_are_collected_per_index(self, tmp_path):
+        integrity = self._scan(tmp_path)
+
+        assert integrity.block_keys["layers"][0] == {"attn.wkv.weight", "ffn.w1.weight"}
+
+    def test_a_block_missing_an_expected_key_becomes_unusable(self, tmp_path):
+        integrity = self._scan(tmp_path)
+        expected = {idx: {"attn.wkv.weight", "ffn.w1.weight"} for idx in range(6)}
+        expected[4].add("hc_attn_fn")
+
+        record_missing_block_keys(integrity, "layers", expected)
+
+        assert not integrity.is_complete
+        assert integrity.missing_keys == {"layers.4": ["hc_attn_fn"]}
+        assert integrity.available_prefix_length("layers") == 4
+        assert "layers.4 has no hc_attn_fn" in integrity.describe()
+
+    def test_structural_differences_between_blocks_are_not_missing_weights(self, tmp_path):
+        """交替出现的权重（如 compress_ratio==4 才有的 attn.indexer）不能被当成缺失。"""
+        weight_map = {"embed.weight": "shared.safetensors"}
+        for idx in range(6):
+            weight_map[f"layers.{idx}.attn.wkv.weight"] = "shared.safetensors"
+            if idx % 2 == 0:
+                weight_map[f"layers.{idx}.attn.indexer.weights_proj.weight"] = "shared.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+        (tmp_path / "shared.safetensors").write_bytes(b"")
+
+        integrity = scan_checkpoint(tmp_path)
+        expected = {}
+        for idx in range(6):
+            keys = {"attn.wkv.weight"}
+            if idx % 2 == 0:
+                keys.add("attn.indexer.weights_proj.weight")
+            expected[idx] = keys
+        record_missing_block_keys(integrity, "layers", expected)
+
+        assert integrity.is_complete
+        assert integrity.available_prefix_length("layers") == 6
+
+    def test_blocks_absent_from_the_index_are_left_to_the_prefix_length(self, tmp_path):
+        integrity = self._scan(tmp_path)
+        expected = {idx: {"attn.wkv.weight", "ffn.w1.weight"} for idx in range(9)}
+
+        record_missing_block_keys(integrity, "layers", expected)
+
+        assert integrity.is_complete
+        assert integrity.available_prefix_length("layers") == 6
+
+    def test_a_missing_key_combines_with_a_missing_shard(self, tmp_path):
+        model_path = _build_checkpoint(
+            tmp_path,
+            num_layers=6,
+            num_mtp=0,
+            present_files=[
+                "model-00000.safetensors",
+                "model-00001.safetensors",
+                "model-00002.safetensors",
+                "model-00003.safetensors",
+            ],
+        )
+        integrity = scan_checkpoint(model_path)
+        expected = {idx: {"attn.wkv.weight", "ffn.w1.weight"} for idx in range(6)}
+        expected[1].add("hc_attn_fn")
+
+        record_missing_block_keys(integrity, "layers", expected)
+
+        # 分片丢了 layers.3-5，index 又漏了 layers.1 的一个权重 -> 只剩 0 可用
+        assert integrity.available_prefix_length("layers") == 1
