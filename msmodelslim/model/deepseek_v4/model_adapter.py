@@ -20,6 +20,7 @@ See the Mulan PSL v2 for more details.
 """
 
 import os.path
+from contextlib import contextmanager
 from typing import List, Any, Generator, Optional, Tuple, Dict
 from unittest.mock import patch
 
@@ -35,6 +36,7 @@ from msmodelslim.processor.quarot import QuaRotInterface
 from msmodelslim.utils.exception import InvalidModelError
 from msmodelslim.utils.logging import logger_setter, get_logger
 from msmodelslim.utils.security import json_safe_load, json_safe_dump
+from . import model as v4_model
 from .convert_fp8_to_bf16 import auto_dequant_state_dict
 from .model import Transformer, ModelArgs, Block
 from .mtp_quant_module import get_mtp_layer, wrap_mtp_decoder, remove_zero_and_shift
@@ -42,6 +44,7 @@ from ..common.checkpoint_integrity import (
     CheckpointIntegrity,
     clamp_block_count,
     enforce_checkpoint_integrity,
+    record_declared_block_count,
     record_missing_block_keys,
     scan_checkpoint,
 )
@@ -576,7 +579,7 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
         config_data.update(overrides)
         config_data['msmodelslim_truncated_from'] = {
             'model_path': str(self.model_path),
-            'missing_weight_files': getattr(getattr(self, 'checkpoint_integrity', None), 'missing_files', []),
+            'reason': getattr(self.config, 'checkpoint_truncation_summary', ''),
         }
         json_safe_dump(config_data, config_file, indent=2, check_user_stat=True)
         get_logger().warning(
@@ -619,6 +622,8 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
         """
         integrity = scan_checkpoint(self.model_path)
         self._record_expected_layer_keys(integrity, args)
+        record_declared_block_count(integrity, 'layers', int(getattr(args, 'num_hidden_layers', 0)))
+        record_declared_block_count(integrity, 'mtp', int(getattr(args, 'n_mtp_layers', 0)))
         integrity = enforce_checkpoint_integrity(integrity, self.model_path)
         # pylint: disable=attribute-defined-outside-init
         self.checkpoint_integrity = integrity
@@ -638,7 +643,29 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
                     args.n_mtp_layers,
                 )
         args.checkpoint_truncated = True
+        # 第一次截断时的说明最完整（dspark 会再调一次，那时已经是自洽的了），别被覆盖。
+        if not getattr(args, 'checkpoint_truncation_summary', ''):
+            args.checkpoint_truncation_summary = integrity.describe()
         return integrity
+
+    @staticmethod
+    @contextmanager
+    def _meta_build_scope():
+        """在 meta device 上搭模块（只为拿参数名），退出时清掉被污染的张量缓存。
+
+        model.py 里 precompute_freqs_cis 这类工厂带 @lru_cache，按「当前默认 device」建
+        张量。如果它第一次被命中是在 meta 上下文里，缓存住的就是 meta 张量，之后真正建
+        模型时 Attention.freqs_cis 这个 buffer 也成了 meta，等 LoadProcessor 把 layers.0
+        搬到 npu 就会炸 NotImplementedError: Cannot copy out of meta tensor。
+        缓存项都是纯计算结果，清掉只是重算一次，没有别的代价。
+        """
+        caches = [obj for obj in vars(v4_model).values() if callable(obj) and hasattr(obj, 'cache_clear')]
+        try:
+            with torch.device('meta'), patch.object(nn.Linear, 'reset_parameters', lambda _self: None):
+                yield
+        finally:
+            for cache in caches:
+                cache.cache_clear()
 
     def _record_expected_layer_keys(self, integrity: CheckpointIntegrity, args: object) -> None:
         """逐层核对 index 是否列全了这一层真正需要的权重。
@@ -655,7 +682,7 @@ class DeepSeekV4ModelAdapter(  # pylint: disable=too-many-ancestors
         ratios = getattr(args, 'compress_ratios', None) or ()
         expected: Dict[int, set] = {}
         try:
-            with torch.device('meta'), patch.object(nn.Linear, 'reset_parameters', lambda _self: None):
+            with self._meta_build_scope():
                 for idx in range(declared):
                     if idx not in listed:
                         continue

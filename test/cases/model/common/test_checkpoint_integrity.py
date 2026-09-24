@@ -23,6 +23,7 @@ from msmodelslim.model.common.checkpoint_integrity import (
     _format_int_ranges,
     check_checkpoint_or_raise,
     clamp_block_count,
+    record_declared_block_count,
     record_missing_block_keys,
     resolve_block_count,
     scan_checkpoint,
@@ -174,6 +175,15 @@ class TestCheckCheckpointOrRaise:
         assert "embedding" in str(err.value)
 
 
+def _integrity_with_blocks(present, missing_files=("x",)):
+    """真实扫描里 present_blocks 与 block_keys 总是一起产生的，构造时别只给一半。"""
+    return CheckpointIntegrity(
+        missing_files=list(missing_files),
+        present_blocks={"layers": set(present)},
+        block_keys={"layers": {idx: {"w"} for idx in present}},
+    )
+
+
 class TestClampBlockCount:
     def test_complete_checkpoint_keeps_the_declared_count(self):
         integrity = CheckpointIntegrity()
@@ -182,20 +192,26 @@ class TestClampBlockCount:
         assert clamp_block_count(integrity, "layers", 61, "num_hidden_layers") == 61
 
     def test_clamps_to_the_available_prefix(self):
-        integrity = CheckpointIntegrity(missing_files=["x"], present_blocks={"layers": {0, 1, 2}})
+        integrity = _integrity_with_blocks({0, 1, 2})
 
         assert clamp_block_count(integrity, "layers", 61, "num_hidden_layers") == 3
 
     def test_never_grows_beyond_the_declared_count(self):
-        integrity = CheckpointIntegrity(missing_files=["x"], present_blocks={"layers": {0, 1, 2, 3}})
+        integrity = _integrity_with_blocks({0, 1, 2, 3})
 
         assert clamp_block_count(integrity, "layers", 2, "num_hidden_layers") == 2
 
     def test_raises_when_not_even_the_first_block_is_usable(self):
-        integrity = CheckpointIntegrity(missing_files=["x"], present_blocks={"layers": {1, 2}})
+        integrity = _integrity_with_blocks({1, 2})
 
         with pytest.raises(InvalidModelError):
             clamp_block_count(integrity, "layers", 61, "num_hidden_layers")
+
+    def test_an_unknown_prefix_is_left_alone(self):
+        """index 用别的命名方式时不要瞎截 —— 交给加载时报错。"""
+        integrity = _integrity_with_blocks({0, 1})
+
+        assert clamp_block_count(integrity, "model.layers", 61, "num_hidden_layers") == 61
 
 
 class TestRecordMissingBlockKeys:
@@ -273,3 +289,52 @@ class TestRecordMissingBlockKeys:
 
         # 分片丢了 layers.3-5，index 又漏了 layers.1 的一个权重 -> 只剩 0 可用
         assert integrity.available_prefix_length("layers") == 1
+
+
+class TestRecordDeclaredBlockCount:
+    """index 被重写成「只列留下来的张量」时，没有任何文件是缺的。"""
+
+    @staticmethod
+    def _index_covering(tmp_path, layers, mtp=2):
+        weight_map = {"embed.weight": "shared.safetensors", "head.weight": "shared.safetensors"}
+        for idx in layers:
+            weight_map[f"layers.{idx}.attn.wkv.weight"] = "shared.safetensors"
+        for idx in range(mtp):
+            weight_map[f"mtp.{idx}.attn.wkv.weight"] = "shared.safetensors"
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+        (tmp_path / "shared.safetensors").write_bytes(b"")
+        return scan_checkpoint(tmp_path)
+
+    def test_an_index_stopping_short_is_not_complete(self, tmp_path):
+        integrity = self._index_covering(tmp_path, range(4))
+        assert integrity.is_complete  # 文件层面确实一个不缺
+
+        record_declared_block_count(integrity, "layers", 43)
+
+        assert not integrity.is_complete
+        assert integrity.short_prefixes == {"layers": (4, 43)}
+        assert "only covers 4 \"layers\" block(s) while the model declares 43" in integrity.describe()
+
+    def test_full_coverage_stays_complete(self, tmp_path):
+        integrity = self._index_covering(tmp_path, range(43))
+
+        record_declared_block_count(integrity, "layers", 43)
+        record_declared_block_count(integrity, "mtp", 2)
+
+        assert integrity.is_complete
+        assert integrity.short_prefixes == {}
+
+    def test_an_absent_prefix_is_not_reported_as_short(self, tmp_path):
+        """别的模型可能把层叫 model.layers.N，无从判断就别judge。"""
+        integrity = self._index_covering(tmp_path, range(4))
+
+        record_declared_block_count(integrity, "model.layers", 43)
+
+        assert integrity.short_prefixes == {}
+
+    def test_declaring_nothing_is_not_short(self, tmp_path):
+        integrity = self._index_covering(tmp_path, range(4), mtp=0)
+
+        record_declared_block_count(integrity, "mtp", 0)
+
+        assert integrity.short_prefixes == {}

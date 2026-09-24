@@ -73,10 +73,12 @@ class CheckpointIntegrity:
     missing_keys: Dict[str, List[str]] = field(default_factory=dict)
     #: index 里每个 block 实际列出的权重后缀，prefix -> {序号 -> 后缀集合}
     block_keys: Dict[str, Dict[int, Set[str]]] = field(default_factory=dict)
+    #: index 覆盖不到配置声明的数量，prefix -> (可用数, 声明数)
+    short_prefixes: Dict[str, Tuple[int, int]] = field(default_factory=dict)
 
     @property
     def is_complete(self) -> bool:
-        return not self.missing_files and not self.missing_keys
+        return not self.missing_files and not self.missing_keys and not self.short_prefixes
 
     def available_prefix_length(self, prefix: str) -> int:
         """`prefix` 下从 0 开始连续可用的 block 数量。"""
@@ -104,6 +106,11 @@ class CheckpointIntegrity:
             parts.append(
                 f'model.safetensors.index.json does not list every weight of '
                 f'{len(self.missing_keys)} block(s): {"; ".join(samples)}{tail}'
+            )
+        for prefix, (available, declared) in sorted(self.short_prefixes.items()):
+            parts.append(
+                f'model.safetensors.index.json only covers {available} "{prefix}" block(s) '
+                f'while the model declares {declared}'
             )
         for prefix in sorted(self.missing_blocks):
             missing = sorted(self.missing_blocks[prefix])
@@ -228,13 +235,29 @@ def scan_checkpoint(model_path: Union[str, Path]) -> CheckpointIntegrity:
     return integrity
 
 
+def record_declared_block_count(integrity: CheckpointIntegrity, prefix: str, declared: int) -> None:
+    """拿配置声明的 block 数去对 index 实际覆盖到的数量。
+
+    截断权重未必表现为「文件缺失」：如果做截断的脚本顺手重写了
+    model.safetensors.index.json，只把留下来的张量写进去，那么 index 引用的文件一个不少，
+    只是根本没有 layers.4 及以后的条目。这时必须拿 config.json 声明的层数来比，否则这份
+    权重会被当成完整的放过去，跑到第 4 层才报「layers.4.xxx 不在 index 里」。
+    """
+    if declared <= 0 or prefix not in integrity.block_keys:
+        # index 里压根没有这个前缀（命名方式不同），无从判断，交给加载时报错。
+        return
+    available = integrity.available_prefix_length(prefix)
+    if available < declared:
+        integrity.short_prefixes[prefix] = (available, declared)
+
+
 def resolve_block_count(
     integrity: CheckpointIntegrity,
     prefix: str,
     declared: int,
 ) -> int:
     """`prefix` 下可用的 block 数，上限为配置里声明的数量。"""
-    if integrity.is_complete:
+    if prefix not in integrity.block_keys:
         return declared
     return min(declared, integrity.available_prefix_length(prefix))
 
@@ -266,7 +289,8 @@ def enforce_checkpoint_integrity(
             f'Incomplete checkpoint at {model_path}: {summary}',
             action=(
                 'Please download the missing safetensors files, or -- if weights are absent from '
-                'model.safetensors.index.json itself -- re-check the script that produced this checkpoint. '
+                'model.safetensors.index.json itself, or the index stops short of the layer count in '
+                'config.json -- re-check the script that produced this checkpoint. '
                 f'If it was truncated on purpose (a debug model with fewer layers), set '
                 f'{ENV_VAR_ALLOW_TRUNCATED_CHECKPOINT}=1 to quantize only the layers that are complete -- '
                 'the result is NOT numerically usable.'
